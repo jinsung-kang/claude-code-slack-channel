@@ -36,6 +36,7 @@ ALLOWED_CHANNELS=C01FJBRKYDU,C02ABCDEF
 # Optional
 CLAUDE_BIN=claude            # path to claude CLI if not on PATH
 CLAUDE_TIMEOUT_MS=600000     # per-invocation timeout (default 10 min)
+CLAUDE_CWD=/abs/path         # where `claude -p` runs (default: process.cwd() at boot)
 SLACK_STATE_DIR=/custom/dir  # override state directory
 ```
 
@@ -62,6 +63,8 @@ Atomic write: `sessions.json.tmp.<pid>` → `rename()`. Parallel `claude -p` spa
 - **Parallel spawn** — each mention runs independently; a long claude call on thread A does not block a mention on thread B.
 - **Attachments** — not supported; bot posts a heads-up and processes the text only.
 - **`claude -p` output** is parsed as JSON (`{ result, session_id, ... }`), so `--output-format json` is non-optional.
+- **Working directory** — `claude -p` is spawned with `cwd = CLAUDE_CWD` (env override) or the bridge's own `process.cwd()` captured at boot. To review a specific repo, start the bridge from that repo: `cd ~/Project/payhere-work-review && bun run start`.
+- **Prompt shape** — the user's message is wrapped with a `<slack_context>` preamble (channel_id, thread_ts, message_ts, user_id) before being handed to `claude -p`, so skills that need Slack metadata can read it from the prompt. Plain conversations can ignore the preamble. A short trailing note tells Claude it's running under a bridge and the final response text is what gets posted back.
 
 ## Security
 

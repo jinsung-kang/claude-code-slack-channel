@@ -42,6 +42,13 @@ const CLAUDE_TIMEOUT_MS = Math.max(
   Number(process.env['CLAUDE_TIMEOUT_MS']) || 10 * 60 * 1000,
 )
 
+// Where `claude -p` runs. Captured once at boot so a later `process.chdir`
+// (unlikely but cheap insurance) doesn't drift subsequent spawns. If you want
+// the bridge to operate on a specific repo, start the server from that repo:
+//   cd ~/Project/payhere-work-review && bun run start
+// Override explicitly with `CLAUDE_CWD=/abs/path` when needed.
+const CLAUDE_CWD = process.env['CLAUDE_CWD'] ?? process.cwd()
+
 const SLACK_TEXT_LIMIT = 3500 // leave some headroom below Slack's 4000-char cap
 
 // ---------------------------------------------------------------------------
@@ -213,20 +220,38 @@ interface ClaudeFailure {
   ok: false
   error: string
   stderr: string
+  stdout: string
   exitCode: number | null
   timedOut: boolean
   resumeFailed: boolean
 }
 
-function isResumeFailure(stderr: string): boolean {
-  const s = stderr.toLowerCase()
+// Match known resume-failure signatures across Claude CLI versions. Pass
+// BOTH stderr and stdout because `--output-format json` may emit errors on
+// either stream depending on when the failure is detected (pre-JSON-wrap
+// vs. inside the JSON envelope).
+//
+// Observed phrasings:
+//   - "No conversation found with session ID: <uuid>"  (current; Oct 2025+)
+//   - "session not found"                               (earlier)
+//   - "session <id> does not exist" / "has expired"
+//   - "invalid session"
+function isResumeFailure(stderr: string, stdout: string): boolean {
+  const s = `${stderr}\n${stdout}`.toLowerCase()
   return (
-    s.includes('session') &&
-    (s.includes('not found') ||
-      s.includes('expired') ||
-      s.includes('no such session') ||
-      s.includes('does not exist') ||
-      s.includes('invalid session'))
+    s.includes('no conversation found') ||
+    s.includes('session not found') ||
+    s.includes('session expired') ||
+    s.includes('session has expired') ||
+    s.includes('no such session') ||
+    s.includes('session does not exist') ||
+    s.includes('invalid session') ||
+    // Broad safety net: any "session" + "not found" / "not exist" / "invalid"
+    // that the specific patterns above miss.
+    (s.includes('session') &&
+      (s.includes('not found') ||
+        s.includes('not exist') ||
+        s.includes('invalid')))
   )
 }
 
@@ -242,6 +267,7 @@ function runClaude(
     const to = setTimeout(() => ac.abort(), CLAUDE_TIMEOUT_MS)
 
     const proc = spawn(CLAUDE_BIN, args, {
+      cwd: CLAUDE_CWD,
       signal: ac.signal,
       stdio: ['ignore', 'pipe', 'pipe'],
       // No shell — positional prompt arg is passed through exec safely.
@@ -262,6 +288,7 @@ function runClaude(
         ok: false,
         error: `spawn failed: ${err.message}`,
         stderr,
+        stdout,
         exitCode: null,
         timedOut: false,
         resumeFailed: false,
@@ -284,6 +311,7 @@ function runClaude(
               ok: false,
               error: 'claude -p returned no session_id in JSON output',
               stderr,
+              stdout,
               exitCode: 0,
               timedOut: false,
               resumeFailed: false,
@@ -296,6 +324,7 @@ function runClaude(
             ok: false,
             error: `parse JSON output failed: ${err instanceof Error ? err.message : err}`,
             stderr,
+            stdout,
             exitCode: 0,
             timedOut: false,
             resumeFailed: false,
@@ -312,9 +341,11 @@ function runClaude(
           ? `timeout after ${CLAUDE_TIMEOUT_MS}ms`
           : `claude exited ${code}`,
         stderr,
+        stdout,
         exitCode: code,
         timedOut,
-        resumeFailed: Boolean(resumeId) && !timedOut && isResumeFailure(stderr),
+        resumeFailed:
+          Boolean(resumeId) && !timedOut && isResumeFailure(stderr, stdout),
       })
     })
   })
@@ -395,14 +426,63 @@ async function handleMention(rt: Runtime, ev: Record<string, unknown>): Promise<
     return
   }
 
-  // Strip the bot mention from the prompt. If nothing remains, bail out.
-  const prompt = rawText
+  // Normalize Slack's inline link/mention encoding down to plain text so
+  // downstream regex / skills see clean URLs. Slack wraps URLs the user
+  // typed as `<https://example.com>` and labeled links as
+  // `<https://example.com|label>` — if we pass these through verbatim,
+  // skill-side URL extractors grab `https://example.com|label` (pipe +
+  // label included) and 404 on fetch. References:
+  //   https://api.slack.com/reference/surfaces/formatting#retrieving-messages
+  const userText = rawText
+    // 1. Drop bot's own mention entirely
     .replace(new RegExp(`<@${rt.botUserId}>`, 'g'), '')
+    // 2. Labeled URL: <url|label>  →  url
+    .replace(/<((?:https?|mailto):[^|>\s]+)\|[^>]*>/g, '$1')
+    // 3. Bare URL:    <url>        →  url
+    .replace(/<((?:https?|mailto):[^>\s]+)>/g, '$1')
+    // 4. Channel ref: <#C123|name> →  #name   (informational; preserves the name if present)
+    .replace(/<#[A-Z0-9]+\|([^>]+)>/g, '#$1')
+    .replace(/<#[A-Z0-9]+>/g, '')
+    // 5. Other user mentions stay as-is (<@U...>) so the skill can see them.
     .trim()
-  if (!prompt) {
+  if (!userText) {
     await postChunks(rt.web, channel, threadTs, '_(empty prompt — nothing to do)_')
     return
   }
+
+  // Diagnostic: log the first 400 chars of the cleaned text so operators can
+  // see exactly what the skill will receive. Avoid logging full prompts —
+  // users' messages may be sensitive and the stream can get long.
+  console.error(
+    `[bridge] user_text (first 400 chars): ${
+      userText.length > 400 ? userText.slice(0, 400) + '…' : userText
+    }`,
+  )
+
+  // Wrap the user's message with a <slack_context> preamble so skills that
+  // need to know where they are running (channel, thread, user) can read it
+  // from the prompt. Plain conversations can ignore the preamble — Claude
+  // treats it as context, and the final instruction in <user_message> is
+  // what it acts on. Keeping it as structured tags instead of free-form
+  // prose avoids ambiguity when the user's text itself contains phrases
+  // like "channel" or "thread".
+  const prompt = [
+    '<slack_context>',
+    `  <channel_id>${channel}</channel_id>`,
+    `  <thread_ts>${threadTs}</thread_ts>`,
+    `  <message_ts>${ts}</message_ts>`,
+    `  <user_id>${user ?? 'unknown'}</user_id>`,
+    '</slack_context>',
+    '',
+    '<user_message>',
+    userText,
+    '</user_message>',
+    '',
+    'Note: you are running via a Slack bridge. Anything you emit as your',
+    'final response text will be posted back into the thread above. You do',
+    'not have direct Slack API access — the bridge handles posting. If a',
+    'skill requires Slack channel/thread info, read it from <slack_context>.',
+  ].join('\n')
 
   if (Array.isArray(ev['files']) && (ev['files'] as unknown[]).length > 0) {
     await postChunks(
@@ -415,10 +495,12 @@ async function handleMention(rt: Runtime, ev: Record<string, unknown>): Promise<
 
   const key = threadKey(channel, threadTs)
   const prior = rt.sessions.get(key)
-  void addReaction(rt.web, channel, ts, 'thought_balloon')
+  // Immediate ack: tells the user the bridge received the mention and is
+  // working on it, before claude -p produces any output.
+  void addReaction(rt.web, channel, ts, 'eyes')
 
   console.error(
-    `[bridge] claude -p start channel=${channel} thread=${threadTs} resume=${prior ?? 'none'} prompt_len=${prompt.length}`,
+    `[bridge] claude -p start channel=${channel} thread=${threadTs} resume=${prior ?? 'none'} user_text_len=${userText.length}`,
   )
 
   let outcome = await runClaude(prompt, prior)
@@ -443,9 +525,11 @@ async function handleMention(rt: Runtime, ev: Record<string, unknown>): Promise<
     console.error(
       `[bridge] claude -p failed channel=${channel} thread=${threadTs} error=${outcome.error}`,
     )
-    const errSnippet = outcome.stderr.trim().slice(0, 800)
+    // stderr usually carries the diagnostic; fall back to stdout when empty
+    // (some error paths emit structured JSON on stdout instead).
+    const diag = (outcome.stderr.trim() || outcome.stdout.trim()).slice(0, 800)
     const body = `⚠️ \`claude -p\` failed: ${outcome.error}${
-      errSnippet ? `\n\`\`\`\n${errSnippet}\n\`\`\`` : ''
+      diag ? `\n\`\`\`\n${diag}\n\`\`\`` : ''
     }`
     await postChunks(rt.web, channel, threadTs, body)
     void addReaction(rt.web, channel, ts, 'warning')
@@ -500,6 +584,7 @@ async function main(): Promise<void> {
   console.error(
     `[bridge] allowed channels: ${[...cfg.allowedChannels].join(', ') || '(none)'}`,
   )
+  console.error(`[bridge] claude -p cwd: ${CLAUDE_CWD}`)
   console.error(`[bridge] sessions loaded: ${sessions.size}`)
 
   const rt: Runtime = { web, cfg, sessions, selfBotId, botUserId }
