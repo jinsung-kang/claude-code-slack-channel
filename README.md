@@ -172,6 +172,7 @@ Lid close / lid open is handled automatically by the `@slack/socket-mode` librar
 | `SLACK_STATE_DIR` | `<CLAUDE_CWD>/.claude/channels/slack` | Override the state directory |
 | `CLAUDE_BIN` | `claude` | Path to the Claude CLI if not on `PATH` |
 | `CLAUDE_TIMEOUT_MS` | `600000` (10 min) | Per-invocation timeout; child is killed on expiry |
+| `SESSION_MAX_AGE_MS` | `604800000` (7 days) | Drop session mappings older than this at boot. Set to `0` to disable pruning. |
 
 Env vars override `.env` file entries.
 
@@ -186,6 +187,8 @@ Env vars override `.env` file entries.
 Per-repo state — different working directories get independent Slack configs and session maps. No global `~/.claude/channels/slack/` is created or read by default.
 
 `sessions.json` writes are serialised through a single Promise chain, so parallel `claude -p` spawns never corrupt it.
+
+At boot the bridge prunes entries whose Slack `thread_ts` is older than `SESSION_MAX_AGE_MS` (default 7 days). An operator line `[bridge] pruned N stale session entries ...` is logged only when something was actually removed; otherwise boot is silent about it. If a user re-mentions a pruned thread, the resume linkage is gone and the bridge starts a fresh Claude session in that thread.
 
 ## Behavior notes
 

@@ -56,6 +56,18 @@ const CLAUDE_TIMEOUT_MS = Math.max(
   Number(process.env['CLAUDE_TIMEOUT_MS']) || 10 * 60 * 1000,
 )
 
+// Drop session mappings whose thread_ts (= original Slack message timestamp)
+// is older than this many ms at boot. Keeps `sessions.json` from growing
+// unbounded. Default 7 days. Set `SESSION_MAX_AGE_MS=0` to disable pruning.
+//
+// Note we prune by thread birth time, not last activity — if a user re-mentions
+// a 2-week-old thread after pruning, the resume linkage is gone and the next
+// mention starts a fresh session. Same net result as a real resume failure.
+const SESSION_MAX_AGE_MS = Math.max(
+  0,
+  Number(process.env['SESSION_MAX_AGE_MS']) || 7 * 24 * 60 * 60 * 1000,
+)
+
 const SLACK_TEXT_LIMIT = 3500 // leave some headroom below Slack's 4000-char cap
 
 // ---------------------------------------------------------------------------
@@ -160,6 +172,31 @@ function loadSessions(): SessionMap {
     )
     return new Map()
   }
+}
+
+/** Drop entries whose thread_ts is older than `maxAgeMs`. Thread_ts is a
+ * Slack message timestamp in fractional seconds since the Unix epoch, so we
+ * parse the trailing numeric segment of the key (`<channel>:<thread_ts>`) and
+ * compare against `Date.now() - maxAgeMs`. Returns the number of pruned
+ * entries. Skips entries whose thread_ts can't be parsed (leaves them alone
+ * rather than dropping data on ambiguity).
+ *
+ * `maxAgeMs === 0` is treated as "disabled" — no pruning at all. */
+function pruneOldSessions(map: SessionMap, maxAgeMs: number): number {
+  if (maxAgeMs <= 0) return 0
+  const cutoffSec = (Date.now() - maxAgeMs) / 1000
+  let removed = 0
+  for (const key of [...map.keys()]) {
+    const colon = key.lastIndexOf(':')
+    if (colon < 0) continue
+    const threadTs = Number.parseFloat(key.slice(colon + 1))
+    if (!Number.isFinite(threadTs)) continue
+    if (threadTs < cutoffSec) {
+      map.delete(key)
+      removed++
+    }
+  }
+  return removed
 }
 
 // Serialize concurrent saves through one Promise chain so parallel spawns
@@ -579,6 +616,19 @@ async function main(): Promise<void> {
 
   const cfg = loadEnv()
   const sessions = loadSessions()
+
+  // Boot-time housekeeping: drop session mappings older than
+  // `SESSION_MAX_AGE_MS`. Only persist to disk if anything actually changed,
+  // so a cold boot against a fresh/empty map stays no-op.
+  const pruned = pruneOldSessions(sessions, SESSION_MAX_AGE_MS)
+  if (pruned > 0) {
+    console.error(
+      `[bridge] pruned ${pruned} stale session entr${pruned === 1 ? 'y' : 'ies'}`
+        + ` (older than ${Math.round(SESSION_MAX_AGE_MS / (24 * 60 * 60 * 1000))}d)`,
+    )
+    void saveSessions(sessions)
+  }
+
   const web = new WebClient(cfg.botToken)
   const socket = new SocketModeClient({ appToken: cfg.appToken })
 

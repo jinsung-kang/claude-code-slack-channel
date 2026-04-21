@@ -36,6 +36,7 @@ ALLOWED_CHANNELS=C01FJBRKYDU,C02ABCDEF
 # Optional
 CLAUDE_BIN=claude            # path to claude CLI if not on PATH
 CLAUDE_TIMEOUT_MS=600000     # per-invocation timeout (default 10 min)
+SESSION_MAX_AGE_MS=604800000 # drop session entries older than this at boot (default 7d; 0 disables)
 CLAUDE_CWD=/abs/path         # where `claude -p` runs (default: process.cwd() at boot)
 SLACK_STATE_DIR=/custom/dir  # override state directory (default: <CLAUDE_CWD>/.claude/channels/slack)
 ```
