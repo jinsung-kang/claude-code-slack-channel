@@ -195,6 +195,7 @@ At boot the bridge prunes entries whose Slack `thread_ts` is older than `SESSION
 - **Only `app_mention` events are handled.** DMs / ambient channel messages are ignored by design. The bot must be explicitly `@` mentioned.
 - **Channel not in `ALLOWED_CHANNELS`** → silent drop (stderr log only).
 - **Thread continuity**: the first mention in a thread creates a new Claude session; subsequent mentions in that same thread reuse it via `--resume <session_id>`.
+- **Session retention**: at boot, any `sessions.json` entry whose Slack `thread_ts` is older than `SESSION_MAX_AGE_MS` (default **7 days**) is dropped. This keeps the map from growing unbounded as old threads fall out of use. A log line `[bridge] pruned N stale session entries (older than 7d)` is emitted only when something was actually removed. Re-mentioning a pruned thread simply starts a fresh Claude session there. Set `SESSION_MAX_AGE_MS=0` to keep everything forever.
 - **Resume failure** (session expired / not found on Claude's side) → the stale mapping is cleared, the call is retried from scratch, and the thread gets a `_(previous session is gone — starting a new conversation)_` notice.
 - **Slack inline encoding** (`<url|label>`, `<#C|name>`, `<@U>`) is normalised in the incoming text so downstream skills receive clean URLs.
 - **Attachments** are not supported; the bot posts a heads-up note and processes the text only.
@@ -212,6 +213,19 @@ pgrep -af "bun.*index\.ts"
 
 # diagnose a specific reaction failure (e.g. missing scope)
 grep 'reaction :' /path/to/working-dir/bridge.log
+
+# see when the session map was last pruned + how many entries were dropped
+grep 'pruned' /path/to/working-dir/bridge.log
+
+# inspect the current thread_ts age distribution (pre-prune dry run)
+python3 -c "
+import json, time
+now = time.time()
+for k in json.load(open('/path/to/.claude/channels/slack/sessions.json')):
+    _, ts = k.rsplit(':', 1)
+    age_d = (now - float(ts)) / 86400
+    print(f'{age_d:6.2f}d  {k}')
+"
 
 # see what text the bridge passed to claude -p on the last few mentions
 grep 'user_text' /path/to/working-dir/bridge.log | tail
