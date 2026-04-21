@@ -27,7 +27,7 @@ bun run dev          # bun --watch index.ts
 
 ## Config
 
-Tokens + allowlist live in `~/.claude/channels/slack/.env` (auto-chmod 0o600). Env vars override .env values.
+Tokens + allowlist live in `<CLAUDE_CWD>/.claude/channels/slack/.env` (auto-chmod 0o600) — i.e. under the directory the bridge was started from. Env vars override .env values.
 
 ```
 SLACK_BOT_TOKEN=xoxb-...
@@ -37,7 +37,7 @@ ALLOWED_CHANNELS=C01FJBRKYDU,C02ABCDEF
 CLAUDE_BIN=claude            # path to claude CLI if not on PATH
 CLAUDE_TIMEOUT_MS=600000     # per-invocation timeout (default 10 min)
 CLAUDE_CWD=/abs/path         # where `claude -p` runs (default: process.cwd() at boot)
-SLACK_STATE_DIR=/custom/dir  # override state directory
+SLACK_STATE_DIR=/custom/dir  # override state directory (default: <CLAUDE_CWD>/.claude/channels/slack)
 ```
 
 ## Slack App Scopes
@@ -47,10 +47,12 @@ Bot token scopes: `app_mentions:read`, `chat:write`, `reactions:write`. Event su
 ## State Layout
 
 ```
-~/.claude/channels/slack/
+<CLAUDE_CWD>/.claude/channels/slack/
 ├── .env            # tokens (chmod 0o600)
 └── sessions.json   # { "<channel>:<thread_ts>": "<claude_session_id>", ... } (chmod 0o600)
 ```
+
+Per-repo state means different working directories get independent Slack configs/session maps. No global `~/.claude/channels/slack/` is created or read by default.
 
 Atomic write: `sessions.json.tmp.<pid>` → `rename()`. Parallel `claude -p` spawns serialize through a single Promise chain so writes never overlap.
 

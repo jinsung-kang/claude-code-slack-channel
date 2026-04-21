@@ -24,15 +24,29 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
+// Where `claude -p` runs. Captured once at boot so a later `process.chdir`
+// (unlikely but cheap insurance) doesn't drift subsequent spawns. If you want
+// the bridge to operate on a specific repo, start the server from that repo:
+//   cd ~/Project/payhere-work-review && bun run start
+// Override explicitly with `CLAUDE_CWD=/abs/path` when needed.
+//
+// Note: `process.cwd()` here is the shell's cwd when the bridge was exec'd —
+// NOT the bridge source directory. `run.sh` does `cd <target>` before exec,
+// so this ends up pointing at the operator's working repo as expected.
+const CLAUDE_CWD = process.env['CLAUDE_CWD'] ?? process.cwd()
+
+// State directory layout (tokens + session map). Defaults to a
+// `.claude/channels/slack` subtree under CLAUDE_CWD so each working repo gets
+// its own isolated state without polluting $HOME. Override with
+// `SLACK_STATE_DIR=/abs/path` if you really want shared global state.
 const STATE_DIR =
-  process.env['SLACK_STATE_DIR'] ?? join(homedir(), '.claude', 'channels', 'slack')
+  process.env['SLACK_STATE_DIR'] ?? join(CLAUDE_CWD, '.claude', 'channels', 'slack')
 const ENV_FILE = join(STATE_DIR, '.env')
 const SESSIONS_FILE = join(STATE_DIR, 'sessions.json')
 
@@ -41,13 +55,6 @@ const CLAUDE_TIMEOUT_MS = Math.max(
   1_000,
   Number(process.env['CLAUDE_TIMEOUT_MS']) || 10 * 60 * 1000,
 )
-
-// Where `claude -p` runs. Captured once at boot so a later `process.chdir`
-// (unlikely but cheap insurance) doesn't drift subsequent spawns. If you want
-// the bridge to operate on a specific repo, start the server from that repo:
-//   cd ~/Project/payhere-work-review && bun run start
-// Override explicitly with `CLAUDE_CWD=/abs/path` when needed.
-const CLAUDE_CWD = process.env['CLAUDE_CWD'] ?? process.cwd()
 
 const SLACK_TEXT_LIMIT = 3500 // leave some headroom below Slack's 4000-char cap
 
@@ -388,8 +395,14 @@ async function addReaction(
 ): Promise<void> {
   try {
     await web.reactions.add({ channel, timestamp: ts, name })
-  } catch {
-    /* non-critical */
+  } catch (err) {
+    // Non-critical — reactions are UX polish, not correctness. But silent
+    // swallows mask scope issues (e.g. missing `reactions:write`) and Slack
+    // rate-limit signals, so log once per failure.
+    console.error(
+      `[bridge] reaction :${name}: failed on ${channel}/${ts}:`,
+      err instanceof Error ? err.message : err,
+    )
   }
 }
 
@@ -585,6 +598,7 @@ async function main(): Promise<void> {
     `[bridge] allowed channels: ${[...cfg.allowedChannels].join(', ') || '(none)'}`,
   )
   console.error(`[bridge] claude -p cwd: ${CLAUDE_CWD}`)
+  console.error(`[bridge] state dir: ${STATE_DIR}`)
   console.error(`[bridge] sessions loaded: ${sessions.size}`)
 
   const rt: Runtime = { web, cfg, sessions, selfBotId, botUserId }
